@@ -1,0 +1,11 @@
+{
+  "name": "Date to Calendar",
+  "version": "1.0",
+  "manifest_version": 3,
+  "description": "Select a date or time on any page and create a calendar event from it.",
+  "permissions": ["contextMenus", "tabs", "notifications", "downloads"],
+  "host_permissions": ["<all_urls>"],
+  "background": {
+    "service_worker": "background.js"
+  }
+}
