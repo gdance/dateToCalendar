@@ -46,8 +46,19 @@ function generateICS(parsed, title) {
     dtstart = `DTSTART;VALUE=DATE:${toICSDate(parsed.start)}`;
     dtend   = `DTEND;VALUE=DATE:${toICSDate(addDays(parsed.start, 1))}`;
   } else {
-    dtstart = `DTSTART:${toICSDateTime(parsed.start)}`;
-    dtend   = `DTEND:${toICSDateTime(parsed.end || addHours(parsed.start, 1))}`;
+    // If a UTC offset was detected, convert to UTC so calendar apps show the
+    // correct time regardless of where the user's machine is located.
+    // If no timezone was detected, store as floating (no Z) so the calendar
+    // app treats it as local time — the least surprising behaviour.
+    if (parsed.offsetMinutes !== null) {
+      const utcStart = toUTC(parsed.start, parsed.offsetMinutes);
+      const utcEnd   = toUTC(parsed.end || addHours(parsed.start, 1), parsed.offsetMinutes);
+      dtstart = `DTSTART:${toICSDateTime(utcStart)}`;
+      dtend   = `DTEND:${toICSDateTime(utcEnd)}`;
+    } else {
+      dtstart = `DTSTART:${toICSDateTimeLocal(parsed.start)}`;
+      dtend   = `DTEND:${toICSDateTimeLocal(parsed.end || addHours(parsed.start, 1))}`;
+    }
   }
 
   return [
@@ -73,8 +84,87 @@ function toICSDate(date) {
   return `${y}${mo}${d}`;
 }
 
+// UTC datetime with Z suffix
 function toICSDateTime(date) {
   return date.toISOString().replace(/[-:.]/g, '').slice(0, 15) + 'Z';
+}
+
+// Floating (no timezone) datetime — no Z suffix
+function toICSDateTimeLocal(date) {
+  const y  = date.getFullYear();
+  const mo = String(date.getMonth() + 1).padStart(2, '0');
+  const d  = String(date.getDate()).padStart(2, '0');
+  const h  = String(date.getHours()).padStart(2, '0');
+  const mi = String(date.getMinutes()).padStart(2, '0');
+  const s  = String(date.getSeconds()).padStart(2, '0');
+  return `${y}${mo}${d}T${h}${mi}${s}`;
+}
+
+// Shift a local-wall-clock Date to UTC given the source UTC offset in minutes
+function toUTC(date, offsetMinutes) {
+  return new Date(date.getTime() - offsetMinutes * 60_000);
+}
+
+// =============================================================================
+// Timezone parser
+// Known offsets in minutes from UTC. Abbreviations that are ambiguous (e.g.
+// CST = US Central OR China Standard) are listed with the most common meaning.
+// =============================================================================
+
+const TZ_ABBR = {
+  // UTC / GMT
+  UTC: 0, GMT: 0, WET: 0,
+  // North America — standard
+  NST: -210, AST: -240, EST: -300, CST: -360, MST: -420, PST: -480,
+  AKST: -540, HST: -600,
+  // North America — daylight
+  NDT: -150, ADT: -180, EDT: -240, CDT: -300, MDT: -360, PDT: -420,
+  AKDT: -480, HDT: -540,
+  // Europe
+  WEST: 60, CET: 60, CEST: 120, EET: 120, EEST: 180,
+  // Middle East / Asia
+  MSK: 180, GST: 240, PKT: 300, IST: 330, BST_BD: 360,
+  ICT: 420, WIB: 420, CST_CN: 480, HKT: 480, SGT: 480, JST: 540, KST: 540,
+  AEST: 600, ACST: 570, AEDT: 660, NZST: 720, NZDT: 780,
+};
+
+// Matches: UTC+5, GMT-7, UTC+05:30, +0530, -07:00, +05:30, EST, PDT, …
+const TZ_RE = /\b(?:UTC|GMT)([+-]\d{1,2}(?::?\d{2})?)\b|\b([+-]\d{2}:?\d{2})\b|\b([A-Z]{2,5})\b/g;
+
+function parseTimezone(text) {
+  let match;
+  TZ_RE.lastIndex = 0;
+
+  while ((match = TZ_RE.exec(text)) !== null) {
+    // UTC±HH or UTC±HH:MM
+    if (match[1]) {
+      return parseOffsetString(match[1]);
+    }
+    // Standalone ±HHMM or ±HH:MM
+    if (match[2]) {
+      return parseOffsetString(match[2]);
+    }
+    // Named abbreviation
+    if (match[3] && match[3] in TZ_ABBR) {
+      return TZ_ABBR[match[3]];
+    }
+  }
+  return null; // no timezone found
+}
+
+function parseOffsetString(s) {
+  // s is like "+5", "+05:30", "-0700"
+  const sign = s[0] === '-' ? -1 : 1;
+  const digits = s.replace(/[^0-9]/g, '');
+  let hours, mins;
+  if (digits.length <= 2) {
+    hours = parseInt(digits);
+    mins  = 0;
+  } else {
+    hours = parseInt(digits.slice(0, digits.length - 2));
+    mins  = parseInt(digits.slice(-2));
+  }
+  return sign * (hours * 60 + mins);
 }
 
 // =============================================================================
@@ -147,17 +237,23 @@ function parseDateFromText(text) {
     const { y, mo, d } = fn(m);
     if (mo < 0 || mo > 11 || d < 1 || d > 31) continue;
 
-    const time = parseTime(text);
+    const time          = parseTime(text);
+    const offsetMinutes = time ? parseTimezone(text) : null;
+
     if (time) {
-      return { start: new Date(y, mo, d, time.h, time.min, time.sec), allDay: false };
+      return {
+        start: new Date(y, mo, d, time.h, time.min, time.sec),
+        allDay: false,
+        offsetMinutes,
+      };
     }
-    return { start: new Date(y, mo, d), allDay: true };
+    return { start: new Date(y, mo, d), allDay: true, offsetMinutes: null };
   }
 
   // Last resort — browser native parsing
   const fallback = new Date(text);
   if (!isNaN(fallback.getTime())) {
-    return { start: fallback, allDay: false };
+    return { start: fallback, allDay: false, offsetMinutes: parseTimezone(text) };
   }
 
   return null;
