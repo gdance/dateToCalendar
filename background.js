@@ -50,14 +50,13 @@ function generateICS(parsed, title) {
     // correct time regardless of where the user's machine is located.
     // If no timezone was detected, store as floating (no Z) so the calendar
     // app treats it as local time — the least surprising behaviour.
+    const endTime = parsed.end || addHours(parsed.start, 1);
     if (parsed.offsetMinutes !== null) {
-      const utcStart = toUTC(parsed.start, parsed.offsetMinutes);
-      const utcEnd   = toUTC(parsed.end || addHours(parsed.start, 1), parsed.offsetMinutes);
-      dtstart = `DTSTART:${toICSDateTime(utcStart)}`;
-      dtend   = `DTEND:${toICSDateTime(utcEnd)}`;
+      dtstart = `DTSTART:${toICSDateTime(toUTC(parsed.start, parsed.offsetMinutes))}`;
+      dtend   = `DTEND:${toICSDateTime(toUTC(endTime, parsed.offsetMinutes))}`;
     } else {
       dtstart = `DTSTART:${toICSDateTimeLocal(parsed.start)}`;
-      dtend   = `DTEND:${toICSDateTimeLocal(parsed.end || addHours(parsed.start, 1))}`;
+      dtend   = `DTEND:${toICSDateTimeLocal(endTime)}`;
     }
   }
 
@@ -120,6 +119,8 @@ const TZ_ABBR = {
   // North America — daylight
   NDT: -150, ADT: -180, EDT: -240, CDT: -300, MDT: -360, PDT: -420,
   AKDT: -480, HDT: -540,
+  // North America — generic (resolve to DST-aware offset at runtime via resolveNAZone)
+  ET: 'NA_ET', CT: 'NA_CT', MT: 'NA_MT', PT: 'NA_PT', AT: 'NA_AT',
   // Europe
   WEST: 60, CET: 60, CEST: 120, EET: 120, EEST: 180,
   // Middle East / Asia
@@ -128,28 +129,43 @@ const TZ_ABBR = {
   AEST: 600, ACST: 570, AEDT: 660, NZST: 720, NZDT: 780,
 };
 
+// Generic NA timezone codes → [standard offset, daylight offset]
+const NA_ZONES = {
+  NA_ET: [-300, -240], NA_CT: [-360, -300],
+  NA_MT: [-420, -360], NA_PT: [-480, -420], NA_AT: [-240, -180],
+};
+
+// US/Canada DST: second Sunday of March → first Sunday of November
+function isNADST(date) {
+  const y = date.getFullYear();
+  const mar1 = new Date(y, 2, 1);
+  const dstStart = new Date(y, 2, 8 + (7 - mar1.getDay()) % 7);
+  const nov1 = new Date(y, 10, 1);
+  const dstEnd = new Date(y, 10, 1 + (7 - nov1.getDay()) % 7);
+  return date >= dstStart && date < dstEnd;
+}
+
+function resolveOffset(raw, date) {
+  if (typeof raw === 'number') return raw;
+  const zone = NA_ZONES[raw];
+  if (!zone) return null;
+  return isNADST(date) ? zone[1] : zone[0];
+}
+
 // Matches: UTC+5, GMT-7, UTC+05:30, +0530, -07:00, +05:30, EST, PDT, …
 const TZ_RE = /\b(?:UTC|GMT)([+-]\d{1,2}(?::?\d{2})?)\b|\b([+-]\d{2}:?\d{2})\b|\b([A-Z]{2,5})\b/g;
 
+// Returns a numeric offset (minutes) or a NA_* token to be resolved later
 function parseTimezone(text) {
   let match;
   TZ_RE.lastIndex = 0;
 
   while ((match = TZ_RE.exec(text)) !== null) {
-    // UTC±HH or UTC±HH:MM
-    if (match[1]) {
-      return parseOffsetString(match[1]);
-    }
-    // Standalone ±HHMM or ±HH:MM
-    if (match[2]) {
-      return parseOffsetString(match[2]);
-    }
-    // Named abbreviation
-    if (match[3] && match[3] in TZ_ABBR) {
-      return TZ_ABBR[match[3]];
-    }
+    if (match[1]) return parseOffsetString(match[1]);
+    if (match[2]) return parseOffsetString(match[2]);
+    if (match[3] && match[3] in TZ_ABBR) return TZ_ABBR[match[3]];
   }
-  return null; // no timezone found
+  return null;
 }
 
 function parseOffsetString(s) {
@@ -177,12 +193,10 @@ const MONTH_MAP = {
   jan:0, feb:1, mar:2, apr:3, jun:5, jul:6, aug:7, sep:8, oct:9, nov:10, dec:11,
 };
 
-const TIME_RE = /\b(\d{1,2})(?::(\d{2})(?::(\d{2}))?)?\s*(am|pm|AM|PM)\b|\b([01]?\d|2[0-3]):([0-5]\d)\b/;
+const TIME_RE = /\b(\d{1,2})(?::(\d{2})(?::(\d{2}))?)?\s*(am|pm|AM|PM)\b|\b([01]?\d|2[0-3]):([0-5]\d)\b/g;
 
-function parseTime(text) {
-  const m = text.match(TIME_RE);
-  if (!m) return null;
-
+// Parse a single time token from a match array
+function timeFromMatch(m) {
   let h, min, sec;
   if (m[4]) {
     h   = parseInt(m[1]);
@@ -197,6 +211,23 @@ function parseTime(text) {
     sec = 0;
   }
   return { h, min, sec };
+}
+
+// Returns { start, end? } — end is present when a range like "9:30 am to 11:30 am" is found
+function parseTimeRange(text) {
+  TIME_RE.lastIndex = 0;
+  const times = [];
+  let m;
+  while ((m = TIME_RE.exec(text)) !== null) {
+    times.push(timeFromMatch(m));
+  }
+  if (times.length === 0) return null;
+
+  // Treat as range only when two times appear and the text contains "to", "-" or "–" between them
+  if (times.length >= 2 && /\bto\b|–|-/.test(text)) {
+    return { start: times[0], end: times[1] };
+  }
+  return { start: times[0] };
 }
 
 function parseDateFromText(text) {
@@ -237,15 +268,15 @@ function parseDateFromText(text) {
     const { y, mo, d } = fn(m);
     if (mo < 0 || mo > 11 || d < 1 || d > 31) continue;
 
-    const time          = parseTime(text);
-    const offsetMinutes = time ? parseTimezone(text) : null;
-
-    if (time) {
-      return {
-        start: new Date(y, mo, d, time.h, time.min, time.sec),
-        allDay: false,
-        offsetMinutes,
-      };
+    const range = parseTimeRange(text);
+    if (range) {
+      const start = new Date(y, mo, d, range.start.h, range.start.min, range.start.sec);
+      const end   = range.end
+        ? new Date(y, mo, d, range.end.h, range.end.min, range.end.sec)
+        : null;
+      const rawTZ        = parseTimezone(text);
+      const offsetMinutes = rawTZ !== null ? resolveOffset(rawTZ, start) : null;
+      return { start, end, allDay: false, offsetMinutes };
     }
     return { start: new Date(y, mo, d), allDay: true, offsetMinutes: null };
   }
@@ -253,7 +284,8 @@ function parseDateFromText(text) {
   // Last resort — browser native parsing
   const fallback = new Date(text);
   if (!isNaN(fallback.getTime())) {
-    return { start: fallback, allDay: false, offsetMinutes: parseTimezone(text) };
+    const rawTZ = parseTimezone(text);
+    return { start: fallback, allDay: false, offsetMinutes: rawTZ !== null ? resolveOffset(rawTZ, fallback) : null };
   }
 
   return null;
